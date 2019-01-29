@@ -1,0 +1,241 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Cwd 'abs_path';
+use Parallel::Loops;
+use IPC::Cmd qw[can_run run];
+
+sub print_help {
+	print "\n";
+	print "autoautoAug\n";
+	print "\n";
+	print "Description:\n";
+	print "\tExecute Augustus' autoAug.pl automatically if no --singleCPU option is set.\n";
+	print "\tautoautoAug is tested with AUGUSTUS 3.2.2 and 2.5.5\n";
+	print "\n";
+	print "Usage:\n";
+	print "\tautoautoAug [options] -opt <autoAug.pl_options>\n";
+	print "\n";
+	print "Mandatory:\n";
+	print "\t-opt STR" . "\t" . "STR is a file containing all autoAug.pl options in the first line sperated by space\n";
+	print "\t\t\twithout the calling of the autoAug.pl script\n";
+	print "\n";
+	print "Options:\t\t[default]\n";
+	print "\t-t INT\t\tNumber of parallel executed aug-scripts [2]\n";
+	print "\t-speed\t\tExecute all aug-scripts from one batch in parallel [off]\n";
+	print "\t\t\tOverrides -t\n";
+	print "\t-acp STR\tSTR is the Augustus config path to locate autoAug.pl [automatic from bash variables]\n";
+	print "\t-log STR\tSTR is the prefix for log (STR.log) and error (STR.err) files [autoautoAug]\n";
+	print "\t\t\tSTR.log will be used to extract the command that will run after a aug-script\n";
+	print "\t\t\tbatch is finished\n";
+	print "\t-h or -help\tPrint this help and exit\n";
+	exit;
+}
+
+my $config_path = `echo \$AUGUSTUS_CONFIG_PATH`;
+chomp $config_path;
+if ($config_path ne "" and substr($config_path,-1) ne "/"){
+	$config_path = $config_path . "/";
+}
+my $opt = "";
+my $species;
+my $abs_path = abs_path();
+my $maxProcs = 2;
+my $logpre = "autoautoAug";
+my $speed = 0;
+my $autoAug_path = "";
+
+for (my $i = 0; $i < scalar(@ARGV); $i++){
+	if ($ARGV[$i] eq "-acp"){
+		$config_path = $ARGV[$i+1];
+		if (substr($config_path,-1) ne "/"){
+			$config_path = $config_path . "/";
+		}
+	}
+	if ($ARGV[$i] eq "-opt"){
+		$opt = `head -n 1 $ARGV[$i+1]`;
+		chomp $opt;
+	}
+	if ($ARGV[$i] eq "-t"){
+		$maxProcs = $ARGV[$i+1];
+	}
+	if ($ARGV[$i] eq "-log"){
+		$logpre = $ARGV[$i+1];
+	}
+	if ($ARGV[$i] eq "-speed"){
+		$speed = 1;
+	}
+	if ($ARGV[$i] eq "-h" or $ARGV[$i] eq "-help"){
+		print_help;
+	}
+}
+
+if(-e "$logpre.log"){
+        system("rm $logpre.log");
+}
+if(-e "$logpre.err"){
+        system("rm $logpre.err");
+}
+
+open (ERR, '>', "$logpre.err") or die "Could not open errorlog-file $logpre.err" . "\n";
+
+if ($config_path eq ""){
+	print ERR "[autoautoAug] \$AUGUSTUS_CONFIG_PATH is undefined! Searching autoAug.pl in \$PATH...\n";
+	$autoAug_path = can_run("autoAug.pl") or die "[autoautoAug] autoAug.pl is not in your path!\n[autoautoAug] Please specify the augustus config path with -acp\n";
+}
+else{
+	$autoAug_path = $config_path . "../scripts/autoAug.pl";
+}
+
+if($opt eq ""){
+	print STDERR "[autoautoAug] No options for autoAug.pl specified\n";
+	print ERR "[autoautoAug] No options for autoAug.pl specified\n";
+	exit;
+}
+
+if($opt =~ m/--singleCPU/){
+	print STDERR "[autoautoAug] --singleCPU option detected!\n";
+	print ERR "[autoautoAug] --singleCPU option detected!\n";
+	exit;
+}
+
+open (LOG, '>>', "$logpre.log") or die "Could not open log-file $logpre.log" . "\n";
+
+print LOG "[autoautoAug] $autoAug_path $opt >> $logpre.log 2>> $logpre.err\n";
+system("$autoAug_path $opt >> $logpre.log 2>> $logpre.err");
+
+my $command = `tail -n 2 $logpre.log | head -n 1`;
+chomp $command;
+$command =~ s/^autoAug\.pl //;
+
+opendir (DIR, "$abs_path/autoAug/autoAugPred_abinitio/shells/") or die "Could not open $abs_path/autoAug/autoAugPred_abinitio/shells/!" . "\n";
+
+my @abinitio_shells;
+
+while (my $file = readdir(DIR)) {
+	next unless (-f "$abs_path/autoAug/autoAugPred_abinitio/shells/$file");
+	if($file =~ m/^aug/ and $file !~ m/\.out$/){
+		push(@abinitio_shells,"$abs_path/autoAug/autoAugPred_abinitio/shells/$file");
+	}
+}
+
+close DIR;
+
+if ($speed == 1){
+	print LOG "[autoautoAug] Setting number of parallel jobs to " . scalar(@abinitio_shells) . "\n";
+	$maxProcs = scalar(@abinitio_shells);
+}
+
+my $abinitio = Parallel::Loops->new($maxProcs);
+$abinitio->foreach( \@abinitio_shells,  sub {
+	print LOG "[autoautoAug] $_\n";
+	system("$_");
+});
+
+print LOG "[autoautoAug] $autoAug_path $command >> $logpre.log 2>> $logpre.err\n";
+system("$autoAug_path $command >> $logpre.log 2>> $logpre.err");
+
+$command = `tail -n 2 $logpre.log | head -n 1`;
+chomp $command;
+$command =~ s/autoAug\/seq\/genome_clean.fa/autoAug\/seq\/genome.fa/;
+
+
+#if there is a EST alignment specified in the autoAug/autoautoAug options use the one specified and do not point to a non existing file
+if($opt =~ m/--estali=/){
+	my $estali;
+	my @arr = split(/\s/,$opt);
+	foreach(@arr){
+		if ($_ =~ m/^--estali=/){
+			$estali = $_;
+		}
+	}
+	$command =~ s/--estali=your\.cdna\.psl/$estali/;
+}
+else{
+	$command =~ s/your\.cdna\.psl/$abs_path\/autoAug\/cdna\/cdna.f.psl/;
+}
+
+
+$command =~ s/^autoAug\.pl //;
+
+opendir (DIR2, "$abs_path/autoAug/autoAugPred_hints/shells/") or die "Could not open $abs_path/autoAug/autoAugPred_hints/shells/!" . "\n";
+
+my %hints_shells;
+
+while (my $file = readdir(DIR2)) {
+	next unless (-f "$abs_path/autoAug/autoAugPred_hints/shells/$file");
+	if($file =~ m/^aug/ and $file !~ m/\.out$/){
+		$hints_shells{$file} = `head -n 1 $abs_path/autoAug/autoAugPred_hints/shells/$file`;
+		chomp $hints_shells{$file};
+		$hints_shells{$file} =~ s/--hintsfile=\.\.\/\.\.\/hints\/hints\.gff/--hintsfile=$abs_path\/autoAug\/hints\/hints\.gff/;
+	}
+}
+
+close DIR2;
+
+my @hints_shells_keys = keys(%hints_shells);
+
+if ($speed == 1){
+	print LOG "[autoautoAug] Setting number of parallel jobs to " . scalar(@hints_shells_keys) . "\n";
+	$maxProcs = scalar(@hints_shells_keys);
+}
+
+my $hints = Parallel::Loops->new($maxProcs);
+$hints->foreach( \@hints_shells_keys,  sub {
+	print LOG "[autoautoAug] $abs_path/autoAug/autoAugPred_hints/shells/$_\n";
+	system("$hints_shells{$_}");
+});
+
+print LOG "[autoautoAug] $autoAug_path $command >> $logpre.log 2>> $logpre.err\n";
+system("$autoAug_path $command >> $logpre.log 2>> $logpre.err");
+
+$command = `tail -n 2 $logpre.log | head -n 1`;
+chomp $command;
+
+my %hints_utr_shells;
+
+if($command =~ m/^autoAug.pl /){
+	opendir (DIR3, "$abs_path/autoAug/autoAugPred_hints_utr/shells/") or die "Could not open $abs_path/autoAug/autoAugPred_hints_utr/shells/!" . "\n";
+	while (my $file = readdir(DIR3)) {
+		next unless (-f "$abs_path/autoAug/autoAugPred_hints_utr/shells/$file");
+		if($file =~ m/^aug/ and $file !~ m/\.out$/){
+			$hints_utr_shells{$file} = `head -n 1 $abs_path/autoAug/autoAugPred_hints_utr/shells/$file`;
+			chomp $hints_utr_shells{$file};
+			$hints_utr_shells{$file} =~ s/--hintsfile=\.\.\/\.\.\/hints\/hints\.gff/--hintsfile=$abs_path\/autoAug\/hints\/hints\.gff/;
+		}
+	}
+	close DIR3;
+	
+	my @hints_utr_shells_keys = keys(%hints_utr_shells);
+	
+	if ($speed == 1){
+		print LOG "[autoautoAug] Setting number of parallel jobs to " . scalar(@hints_shells_keys) . "\n";
+		$maxProcs = scalar(@hints_shells_keys);
+	}
+	
+	my $hints_utr = Parallel::Loops->new($maxProcs);
+	$hints_utr->foreach( \@hints_shells_keys,  sub {
+		print LOG "[autoautoAug] $abs_path/autoAug/autoAugPred_hints_utr/shells/$_\n";
+		system("$hints_utr_shells{$_}");
+	});
+	
+	#check if contig.gff exists - if not create it (if it does not exist an error occurs in autoAug.pl)
+	if(not -f "$abs_path/autoAug/seq/contigs.gff"){
+		print LOG "[autoautoAug] $abs_path/autoAug/seq/contigs.gff does not exist!\n";
+		my $scrips_path = $autoAug_path;
+		$scrips_path =~ s/\/autoAug.pl$//;
+		print LOG "[autoautoAug] $scrips_path/summarizeACGTcontent.pl $abs_path/autoAug/seq/genome.fa > $abs_path/autoAug/seq/genome.summary\n";
+		system("$scrips_path/summarizeACGTcontent.pl $abs_path/autoAug/seq/genome.fa > $abs_path/autoAug/seq/genome.summary");
+		print LOG "[autoautoAug] cat $abs_path/autoAug/seq/genome.summary | grep \"bases.\" | perl -pe \'s/(\\d+)\\sbases.\\s+(\\S*) BASE.*/\$2\\tassembly\\tcontig\\t1\\t\$1\\t.\\t.\\t.\\tContig \$2/\' > $abs_path/autoAug/seq/contigs.gff\n";
+		system("cat $abs_path/autoAug/seq/genome.summary | grep \"bases.\" | perl -pe \'s/(\\d+)\\sbases.\\s+(\\S*) BASE.*/\$2\\tassembly\\tcontig\\t1\\t\$1\\t.\\t.\\t.\\tContig \$2/\' > $abs_path/autoAug/seq/contigs.gff");
+	}
+	
+	print LOG "[autoautoAug] $autoAug_path $command >> $logpre.log 2>> $logpre.err\n";
+	system("$autoAug_path $command >> $logpre.log 2>> $logpre.err");
+}
+
+close LOG;
+close ERR;
+
+exit;
